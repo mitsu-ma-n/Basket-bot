@@ -28,6 +28,8 @@ POLL_NAME, MAX_PARTICIPANTS, OPTION1_NAME, OPTION2_NAME = range(4)
 
 # Global storage for polls
 polls = {}
+# Storage for user states in groups
+user_states = {}
 
 
 def format_poll_message(poll_data):
@@ -83,8 +85,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Как использовать бота:\n\n"
         "1. Используйте /create для создания голосования\n"
-        "2. Ответьте на вопросы бота:\n"
-        "   - Название голосования\n"
+        "2. Бот попросит ввести название голосования\n"
+        "3. ВАЖНО! Отправьте название голосования в в чат в виде ответа на сообщение бота. Именно как ответ, а не как отдельное сообщение\n"
         "4. Участники смогут голосовать нажатием кнопок\n\n"
         "💡 Важно: Для работы в других чатах бот должен быть добавлен в них как участник!"
     )
@@ -92,6 +94,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def create_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start creating a new poll."""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    
+    # Store that this user is creating a poll
+    if chat_id not in user_states:
+        user_states[chat_id] = {}
+    user_states[chat_id][user_id] = 'waiting_for_poll_name'
+    
     await update.message.reply_text(
         "Давайте создадим новое голосование!\n\n"
         "Введите название голосования:"
@@ -100,17 +110,26 @@ async def create_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def poll_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receive poll name and ask for max participants."""
-    context.user_data['poll_name'] = update.message.text
+    """Receive poll name and create the poll."""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    
+    # Check if user is in the process of creating a poll
+    if (chat_id not in user_states or 
+        user_id not in user_states[chat_id] or 
+        user_states[chat_id][user_id] != 'waiting_for_poll_name'):
+        return ConversationHandler.END
+    
+    poll_name_text = update.message.text
     
     # Generate unique poll ID
-    poll_id = f"{update.effective_user.id}_{len(polls)}"
+    poll_id = f"{user_id}_{len(polls)}"
     
     # Store poll data
     poll_data = {
         'poll_id': poll_id,
-        'creator_id': update.effective_user.id,
-        'poll_name': context.user_data['poll_name'],
+        'creator_id': user_id,
+        'poll_name': poll_name_text,
         'voters1': [],
         'voters2': [],
         'voter_ids': {}  # Track who voted for what
@@ -139,14 +158,49 @@ async def poll_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     poll_data['message_id'] = poll_message.message_id
     poll_data['chat_id'] = poll_message.chat_id
     
+    # Clear user state
+    if chat_id in user_states and user_id in user_states[chat_id]:
+        del user_states[chat_id][user_id]
+    
     # Clear user data
     context.user_data.clear()
     
     return ConversationHandler.END
 
 
+async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle regular messages in groups to catch poll names."""
+    # Only process if it's a group chat and not a command
+    if (update.effective_chat.type in ['group', 'supergroup'] and 
+        update.message and 
+        update.message.text and 
+        not update.message.text.startswith('/')):
+        
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+        
+        # Check if this user is waiting to provide poll name
+        if (chat_id in user_states and 
+            user_id in user_states[chat_id] and 
+            user_states[chat_id][user_id] == 'waiting_for_poll_name'):
+            
+            # Process as poll name
+            await poll_name(update, context)
+            return
+    
+    # If not in conversation state, ignore the message
+    return
+
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel the conversation."""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    
+    # Clear user state
+    if chat_id in user_states and user_id in user_states[chat_id]:
+        del user_states[chat_id][user_id]
+    
     context.user_data.clear()
     await update.message.reply_text(
         "❌ Создание голосования отменено."
@@ -236,12 +290,6 @@ async def update_poll_message(poll_id: str, context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"Could not update original poll message: {e}")
 
 
-async def handle_forwarded_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle forwarded poll messages to ensure they work correctly."""
-    # This handler ensures that forwarded messages with polls are processed correctly
-    pass
-
-
 def main():
     """Start the bot."""
     # Load environment variables from .env file
@@ -269,6 +317,12 @@ def main():
     application.add_handler(CommandHandler('help', help_command))
     application.add_handler(conv_handler)
     application.add_handler(CallbackQueryHandler(vote_callback, pattern='^vote_'))
+    
+    # Add handler for group messages to catch poll names
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, 
+        handle_group_message
+    ))
     
     # Start the bot
     logger.info("Bot started!")
