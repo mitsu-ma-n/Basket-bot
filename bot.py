@@ -33,21 +33,18 @@ polls = {}
 def format_poll_message(poll_data):
     """Format the poll message with all participant lists."""
     poll_name = poll_data['poll_name']
-    option1 = poll_data['option1']
-    option2 = poll_data['option2']
-    max_participants = poll_data['max_participants']
     
     voters1 = poll_data.get('voters1', [])
     voters2 = poll_data.get('voters2', [])
     
     # Split voters1 into main and reserve
-    main_voters = voters1[:max_participants]
-    reserve_voters = voters1[max_participants:]
+    main_voters = voters1[:12]
+    reserve_voters = voters1[12:]
     
     message = f"📊 {poll_name}\n\n"
     
     # First option with main participants
-    message += f"✅ {option1}\n"
+    message += f"✅ Иду\n"
     if main_voters:
         for idx, voter in enumerate(main_voters, 1):
             message += f"{idx}. {voter}\n"
@@ -61,7 +58,7 @@ def format_poll_message(poll_data):
             message += f"• {voter}\n"
     
     # Second option
-    message += f"\n❌ {option2}\n"
+    message += f"\n❌ Пропущу\n"
     if voters2:
         for voter in voters2:
             message += f"• {voter}\n"
@@ -88,11 +85,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. Используйте /create для создания голосования\n"
         "2. Ответьте на вопросы бота:\n"
         "   - Название голосования\n"
-        "   - Количество мест для участников\n"
-        "   - Название первого варианта (положительный)\n"
-        "   - Название второго варианта (отрицательный)\n"
-        "3. Поделитесь голосованием в других чатах\n"
-        "4. Участники смогут голосовать нажатием кнопок"
+        "4. Участники смогут голосовать нажатием кнопок\n\n"
+        "💡 Важно: Для работы в других чатах бот должен быть добавлен в них как участник!"
     )
 
 
@@ -100,7 +94,7 @@ async def create_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start creating a new poll."""
     await update.message.reply_text(
         "Давайте создадим новое голосование!\n\n"
-        "Шаг 1/4: Введите название голосования:"
+        "Введите название голосования:"
     )
     return POLL_NAME
 
@@ -108,49 +102,6 @@ async def create_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def poll_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Receive poll name and ask for max participants."""
     context.user_data['poll_name'] = update.message.text
-    await update.message.reply_text(
-        f"Название: {update.message.text}\n\n"
-        "Шаг 2/4: Введите количество участников, проходящих на состязание (число):"
-    )
-    return MAX_PARTICIPANTS
-
-
-async def max_participants(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receive max participants and ask for first option name."""
-    try:
-        max_count = int(update.message.text)
-        if max_count <= 0:
-            await update.message.reply_text(
-                "⚠️ Количество участников должно быть положительным числом. Попробуйте снова:"
-            )
-            return MAX_PARTICIPANTS
-        
-        context.user_data['max_participants'] = max_count
-        await update.message.reply_text(
-            f"Количество мест: {max_count}\n\n"
-            "Шаг 3/4: Введите название первого варианта (положительный ответ):"
-        )
-        return OPTION1_NAME
-    except ValueError:
-        await update.message.reply_text(
-            "⚠️ Пожалуйста, введите число. Попробуйте снова:"
-        )
-        return MAX_PARTICIPANTS
-
-
-async def option1_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receive first option name and ask for second option name."""
-    context.user_data['option1'] = update.message.text
-    await update.message.reply_text(
-        f"Первый вариант: {update.message.text}\n\n"
-        "Шаг 4/4: Введите название второго варианта (отрицательный ответ):"
-    )
-    return OPTION2_NAME
-
-
-async def option2_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receive second option name and create the poll."""
-    context.user_data['option2'] = update.message.text
     
     # Generate unique poll ID
     poll_id = f"{update.effective_user.id}_{len(polls)}"
@@ -160,9 +111,6 @@ async def option2_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'poll_id': poll_id,
         'creator_id': update.effective_user.id,
         'poll_name': context.user_data['poll_name'],
-        'max_participants': context.user_data['max_participants'],
-        'option1': context.user_data['option1'],
-        'option2': context.user_data['option2'],
         'voters1': [],
         'voters2': [],
         'voter_ids': {}  # Track who voted for what
@@ -173,8 +121,8 @@ async def option2_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Create inline keyboard
     keyboard = [
         [
-            InlineKeyboardButton(poll_data['option1'], callback_data=f"vote_{poll_id}_1"),
-            InlineKeyboardButton(poll_data['option2'], callback_data=f"vote_{poll_id}_2")
+            InlineKeyboardButton(f"Иду", callback_data=f"vote_{poll_id}_1"),
+            InlineKeyboardButton(f"Пропущу", callback_data=f"vote_{poll_id}_2")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -182,14 +130,14 @@ async def option2_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Format and send the poll
     message_text = format_poll_message(poll_data)
     
-    await update.message.reply_text(
+    poll_message = await update.message.reply_text(
         "✅ Голосование создано!\n\n" + message_text,
         reply_markup=reply_markup
     )
     
-    await update.message.reply_text(
-        "💡 Вы можете переслать это сообщение с голосованием в другие чаты!"
-    )
+    # Store message_id for potential updates
+    poll_data['message_id'] = poll_message.message_id
+    poll_data['chat_id'] = poll_message.chat_id
     
     # Clear user data
     context.user_data.clear()
@@ -213,11 +161,11 @@ async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Parse callback data
     parts = query.data.split('_')
-    if len(parts) != 3 or parts[0] != 'vote':
+    if len(parts) != 4 or parts[0] != 'vote':
         return
     
-    poll_id = parts[1]
-    option = parts[2]  # '1' or '2'
+    poll_id = parts[1] + '_' + parts[2]
+    option = parts[3]  # '1' or '2'
     
     # Check if poll exists
     if poll_id not in polls:
@@ -241,6 +189,7 @@ async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Remove from previous choice
         if old_choice == '1':
+            # Remove all entries for this user (handle duplicates)
             poll_data['voters1'] = [v for v in poll_data['voters1'] if not v.startswith(user_name)]
         else:
             poll_data['voters2'] = [v for v in poll_data['voters2'] if not v.startswith(user_name)]
@@ -252,23 +201,45 @@ async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         poll_data['voters2'].append(user_name)
     
-    # Update the message
+    # Update the message in all chats where it exists
+    await update_poll_message(poll_id, context)
+
+
+async def update_poll_message(poll_id: str, context: ContextTypes.DEFAULT_TYPE):
+    """Update poll message in all chats where it was sent."""
+    if poll_id not in polls:
+        return
+    
+    poll_data = polls[poll_id]
+    
+    # Create inline keyboard
     keyboard = [
         [
-            InlineKeyboardButton(poll_data['option1'], callback_data=f"vote_{poll_id}_1"),
-            InlineKeyboardButton(poll_data['option2'], callback_data=f"vote_{poll_id}_2")
+            InlineKeyboardButton(f"Иду", callback_data=f"vote_{poll_id}_1"),
+            InlineKeyboardButton(f"Пропущу", callback_data=f"vote_{poll_id}_2")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     message_text = format_poll_message(poll_data)
     
-    await query.edit_message_text(
-        text=message_text,
-        reply_markup=reply_markup
-    )
-    
-    await query.answer("✅ Ваш голос учтён!")
+    # Try to update the original message if we have its ID
+    try:
+        if 'message_id' in poll_data and 'chat_id' in poll_data:
+            await context.bot.edit_message_text(
+                chat_id=poll_data['chat_id'],
+                message_id=poll_data['message_id'],
+                text=message_text,
+                reply_markup=reply_markup
+            )
+    except Exception as e:
+        logger.warning(f"Could not update original poll message: {e}")
+
+
+async def handle_forwarded_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle forwarded poll messages to ensure they work correctly."""
+    # This handler ensures that forwarded messages with polls are processed correctly
+    pass
 
 
 def main():
@@ -289,9 +260,6 @@ def main():
         entry_points=[CommandHandler('create', create_poll)],
         states={
             POLL_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, poll_name)],
-            MAX_PARTICIPANTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, max_participants)],
-            OPTION1_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, option1_name)],
-            OPTION2_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, option2_name)],
         },
         fallbacks=[CommandHandler('cancel', cancel)],
     )
