@@ -14,6 +14,8 @@ from telegram.ext import (
     ContextTypes,
 )
 
+from dotenv import load_dotenv
+
 # Enable logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -270,6 +272,8 @@ async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Start the bot."""
+    # Load environment variables from .env file
+    load_dotenv()
     # Get token from environment
     token = os.getenv('TELEGRAM_BOT_TOKEN')
     if not token:
