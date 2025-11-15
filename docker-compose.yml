@@ -1,0 +1,32 @@
+services:
+  bot:
+    build: .
+    container_name: basket_bot
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      - db
+    volumes:
+      - .:/app
+
+  db:
+    image: postgres:18
+    container_name: basket_bot_db
+    restart: always
+    env_file: .env
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+
+  adminer:
+    image: adminer
+    container_name: basket_bot_adminer
+    restart: always
+    ports:
+      - "8080:8080"
+    env_file: .env
+
+volumes:
+  postgres_data:
