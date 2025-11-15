@@ -3,7 +3,12 @@
 
 import os
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultArticle, InputTextMessageContent
+import asyncpg
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -14,320 +19,337 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-
 from dotenv import load_dotenv
 
-# Enable logging
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Conversation states
-POLL_NAME, MAX_PARTICIPANTS, OPTION1_NAME, OPTION2_NAME = range(4)
+# States
+POLL_NAME = range(1)
 
-# Global storage for polls
-polls = {}
-# Storage for user states in groups
-user_states = {}
+# ────────────────────────────────────────────
+# DATABASE ACCESS LAYER
+# ────────────────────────────────────────────
+
+class Database:
+    def __init__(self):
+        self.pool = None
+
+    async def connect(self):
+        self.pool = await asyncpg.create_pool(os.getenv("DATABASE_URL"))
+        await self.create_tables()
+
+    async def create_tables(self):
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS polls (
+                    poll_id TEXT PRIMARY KEY,
+                    creator_id BIGINT,
+                    chat_id BIGINT,
+                    message_id BIGINT,
+                    poll_name TEXT
+                );
+            """)
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS poll_votes (
+                    poll_id TEXT,
+                    user_id BIGINT,
+                    user_name TEXT,
+                    choice SMALLINT,
+                    PRIMARY KEY (poll_id, user_id),
+                    FOREIGN KEY (poll_id) REFERENCES polls(poll_id) ON DELETE CASCADE
+                );
+            """)
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_states (
+                    chat_id BIGINT,
+                    user_id BIGINT,
+                    state TEXT,
+                    PRIMARY KEY (chat_id, user_id)
+                );
+            """)
+
+    # USER STATES -----------------------------------------------------------
+
+    async def set_user_state(self, chat_id, user_id, state):
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO user_states(chat_id, user_id, state)
+                VALUES($1, $2, $3)
+                ON CONFLICT (chat_id, user_id)
+                DO UPDATE SET state=EXCLUDED.state;
+            """, chat_id, user_id, state)
+
+    async def get_user_state(self, chat_id, user_id):
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT state FROM user_states
+                WHERE chat_id=$1 AND user_id=$2
+            """, chat_id, user_id)
+            return row["state"] if row else None
+
+    async def clear_user_state(self, chat_id, user_id):
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                DELETE FROM user_states
+                WHERE chat_id=$1 AND user_id=$2
+            """, chat_id, user_id)
+
+    # POLLS -----------------------------------------------------------------
+
+    async def create_poll(self, poll_id, creator_id, chat_id, message_id, poll_name):
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO polls(poll_id, creator_id, chat_id, message_id, poll_name)
+                VALUES($1, $2, $3, $4, $5)
+            """, poll_id, creator_id, chat_id, message_id, poll_name)
+
+    async def get_poll(self, poll_id):
+        async with self.pool.acquire() as conn:
+            poll = await conn.fetchrow("SELECT * FROM polls WHERE poll_id=$1", poll_id)
+            if not poll:
+                return None
+
+            votes = await conn.fetch("""
+                SELECT user_id, user_name, choice
+                FROM poll_votes
+                WHERE poll_id=$1
+                ORDER BY user_name
+            """, poll_id)
+
+            voters1 = [v["user_name"] for v in votes if v["choice"] == 1]
+            voters2 = [v["user_name"] for v in votes if v["choice"] == 2]
+
+            return {
+                "poll_id": poll["poll_id"],
+                "creator_id": poll["creator_id"],
+                "chat_id": poll["chat_id"],
+                "message_id": poll["message_id"],
+                "poll_name": poll["poll_name"],
+                "voters1": voters1,
+                "voters2": voters2
+            }
+
+    async def add_vote(self, poll_id, user_id, user_name, choice):
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO poll_votes(poll_id, user_id, user_name, choice)
+                VALUES($1, $2, $3, $4)
+                ON CONFLICT (poll_id, user_id)
+                DO UPDATE SET user_name=EXCLUDED.user_name, choice=EXCLUDED.choice;
+            """, poll_id, user_id, user_name, choice)
 
 
-def format_poll_message(poll_data):
-    """Format the poll message with all participant lists."""
-    poll_name = poll_data['poll_name']
-    
-    voters1 = poll_data.get('voters1', [])
-    voters2 = poll_data.get('voters2', [])
-    
-    # Split voters1 into main and reserve
-    main_voters = voters1[:12]
-    reserve_voters = voters1[12:]
-    
-    message = f"📊 {poll_name}\n\n"
-    
-    # First option with main participants
-    message += f"✅ Иду\n"
-    if main_voters:
-        for idx, voter in enumerate(main_voters, 1):
-            message += f"{idx}. {voter}\n"
+db = Database()
+
+# ────────────────────────────────────────────
+# BUSINESS LOGIC
+# ────────────────────────────────────────────
+
+def format_poll_message(poll):
+    poll_name = poll["poll_name"]
+    voters1 = poll["voters1"]
+    voters2 = poll["voters2"]
+
+    main = voters1[:12]
+    reserve = voters1[12:]
+
+    msg = f"📊 {poll_name}\n\n"
+
+    msg += "✅ Иду\n"
+    if main:
+        msg += "\n".join(f"{i+1}. {v}" for i, v in enumerate(main)) + "\n"
     else:
-        message += "Нет участников\n"
-    
-    # Reserve section
-    if reserve_voters:
-        message += f"\n🔄 Запас\n"
-        for voter in reserve_voters:
-            message += f"• {voter}\n"
-    
-    # Second option
-    message += f"\n❌ Пропущу\n"
+        msg += "Нет участников\n"
+
+    if reserve:
+        msg += "\n🔄 Запас\n"
+        msg += "\n".join(f"• {v}" for v in reserve) + "\n"
+
+    msg += "\n❌ Пропущу\n"
     if voters2:
-        for voter in voters2:
-            message += f"• {voter}\n"
+        msg += "\n".join(f"• {v}" for v in voters2) + "\n"
     else:
-        message += "Нет участников\n"
-    
-    return message
+        msg += "Нет участников\n"
+
+    return msg
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command handler."""
+# ────────────────────────────────────────────
+# COMMAND HANDLERS
+# ────────────────────────────────────────────
+
+async def start(update, context):
     await update.message.reply_text(
         "Привет! Я бот для создания голосований.\n\n"
-        "Команды:\n"
-        "/create - Создать новое голосование\n"
-        "/help - Показать справку"
+        "/create — создать голосование\n"
+        "/help — помощь"
     )
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Help command handler."""
+async def help_command(update, context):
     await update.message.reply_text(
-        "Как использовать бота:\n\n"
-        "1. Используйте /create для создания голосования\n"
-        "2. Бот попросит ввести название голосования\n"
-        "3. ВАЖНО! Отправьте название голосования в в чат в виде ответа на сообщение бота. Именно как ответ, а не как отдельное сообщение\n"
-        "4. Участники смогут голосовать нажатием кнопок\n\n"
-        "💡 Важно: Для работы в других чатах бот должен быть добавлен в них как участник!"
+        "Инструкция по созданию голосования:\n"
+        "1) Нажмите /create\n"
+        "2) Введите название голосования ответом на сообщение бота"
     )
 
 
-async def create_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start creating a new poll."""
-    user_id = update.effective_user.id
+async def create_poll(update, context):
     chat_id = update.effective_chat.id
-    
-    # Store that this user is creating a poll
-    if chat_id not in user_states:
-        user_states[chat_id] = {}
-    user_states[chat_id][user_id] = 'waiting_for_poll_name'
-    
+    user_id = update.effective_user.id
+
+    await db.set_user_state(chat_id, user_id, "waiting_name")
+
     await update.message.reply_text(
-        "Давайте создадим новое голосование!\n\n"
         "Введите название голосования:"
     )
     return POLL_NAME
 
 
-async def poll_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receive poll name and create the poll."""
-    user_id = update.effective_user.id
+async def poll_name(update, context):
     chat_id = update.effective_chat.id
-    
-    # Check if user is in the process of creating a poll
-    if (chat_id not in user_states or 
-        user_id not in user_states[chat_id] or 
-        user_states[chat_id][user_id] != 'waiting_for_poll_name'):
+    user_id = update.effective_user.id
+
+    state = await db.get_user_state(chat_id, user_id)
+    if state != "waiting_name":
         return ConversationHandler.END
-    
-    poll_name_text = update.message.text
-    
-    # Generate unique poll ID
-    poll_id = f"{user_id}_{len(polls)}"
-    
-    # Store poll data
-    poll_data = {
-        'poll_id': poll_id,
-        'creator_id': user_id,
-        'poll_name': poll_name_text,
-        'voters1': [],
-        'voters2': [],
-        'voter_ids': {}  # Track who voted for what
-    }
-    
-    polls[poll_id] = poll_data
-    
-    # Create inline keyboard
-    keyboard = [
-        [
-            InlineKeyboardButton(f"Иду", callback_data=f"vote_{poll_id}_1"),
-            InlineKeyboardButton(f"Пропущу", callback_data=f"vote_{poll_id}_2")
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    # Format and send the poll
-    message_text = format_poll_message(poll_data)
-    
-    poll_message = await update.message.reply_text(
-        "✅ Голосование создано!\n\n" + message_text,
-        reply_markup=reply_markup
+
+    title = update.message.text
+    poll_id = f"{user_id}_{update.message.message_id}"
+
+    # Send poll
+    keyboard = [[
+        InlineKeyboardButton("Иду", callback_data=f"vote_{poll_id}_1"),
+        InlineKeyboardButton("Пропущу", callback_data=f"vote_{poll_id}_2"),
+    ]]
+    markup = InlineKeyboardMarkup(keyboard)
+
+    msg = await update.message.reply_text(
+        f"✅ Голосование создано!\n\n{title}",
+        reply_markup=markup
     )
-    
-    # Store message_id for potential updates
-    poll_data['message_id'] = poll_message.message_id
-    poll_data['chat_id'] = poll_message.chat_id
-    
-    # Clear user state
-    if chat_id in user_states and user_id in user_states[chat_id]:
-        del user_states[chat_id][user_id]
-    
-    # Clear user data
-    context.user_data.clear()
-    
+
+    await db.create_poll(
+        poll_id=poll_id,
+        creator_id=user_id,
+        chat_id=msg.chat_id,
+        message_id=msg.message_id,
+        poll_name=title
+    )
+
+    await db.clear_user_state(chat_id, user_id)
     return ConversationHandler.END
 
 
-async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle regular messages in groups to catch poll names."""
-    # Only process if it's a group chat and not a command
-    if (update.effective_chat.type in ['group', 'supergroup'] and 
-        update.message and 
-        update.message.text and 
-        not update.message.text.startswith('/')):
-        
-        user_id = update.effective_user.id
-        chat_id = update.effective_chat.id
-        
-        # Check if this user is waiting to provide poll name
-        if (chat_id in user_states and 
-            user_id in user_states[chat_id] and 
-            user_states[chat_id][user_id] == 'waiting_for_poll_name'):
-            
-            # Process as poll name
-            await poll_name(update, context)
-            return
-    
-    # If not in conversation state, ignore the message
-    return
+async def handle_group_message(update, context):
+    if update.message.text.startswith('/'):
+        return
 
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel the conversation."""
-    user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    
-    # Clear user state
-    if chat_id in user_states and user_id in user_states[chat_id]:
-        del user_states[chat_id][user_id]
-    
-    context.user_data.clear()
-    await update.message.reply_text(
-        "❌ Создание голосования отменено."
-    )
+    user_id = update.effective_user.id
+
+    state = await db.get_user_state(chat_id, user_id)
+    if state == "waiting_name":
+        await poll_name(update, context)
+
+
+async def cancel(update, context):
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    await db.clear_user_state(chat_id, user_id)
+    await update.message.reply_text("❌ Создание голосования отменено.")
     return ConversationHandler.END
 
 
-async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle voting button clicks."""
-    query = update.callback_query
-    await query.answer()
-    
-    # Parse callback data
-    parts = query.data.split('_')
-    if len(parts) != 4 or parts[0] != 'vote':
+# ────────────────────────────────────────────
+# VOTE HANDLING
+# ────────────────────────────────────────────
+
+async def vote_callback(update, context):
+    q = update.callback_query
+    await q.answer()
+
+    _, poll_id_part1, poll_id_part2, choice = q.data.split('_')
+    poll_id = f"{poll_id_part1}_{poll_id_part2}"
+
+    poll = await db.get_poll(poll_id)
+    if not poll:
+        await q.answer("Голосование не найдено!", show_alert=True)
         return
-    
-    poll_id = parts[1] + '_' + parts[2]
-    option = parts[3]  # '1' or '2'
-    
-    # Check if poll exists
-    if poll_id not in polls:
-        await query.answer("⚠️ Голосование не найдено!", show_alert=True)
-        return
-    
-    poll_data = polls[poll_id]
-    user_id = query.from_user.id
-    user_name = query.from_user.first_name
-    if query.from_user.last_name:
-        user_name += f" {query.from_user.last_name}"
-    
-    # Check if user already voted
-    if user_id in poll_data['voter_ids']:
-        old_choice = poll_data['voter_ids'][user_id]
-        
-        # If voting for the same option, do nothing
-        if old_choice == option:
-            await query.answer("Вы уже проголосовали за этот вариант!", show_alert=True)
-            return
-        
-        # Remove from previous choice
-        if old_choice == '1':
-            # Remove all entries for this user (handle duplicates)
-            poll_data['voters1'] = [v for v in poll_data['voters1'] if not v.startswith(user_name)]
-        else:
-            poll_data['voters2'] = [v for v in poll_data['voters2'] if not v.startswith(user_name)]
-    
-    # Add vote to new choice
-    poll_data['voter_ids'][user_id] = option
-    if option == '1':
-        poll_data['voters1'].append(user_name)
-    else:
-        poll_data['voters2'].append(user_name)
-    
-    # Update the message in all chats where it exists
+
+    user_name = q.from_user.first_name
+    if q.from_user.last_name:
+        user_name += " " + q.from_user.last_name
+
+    await db.add_vote(
+        poll_id,
+        q.from_user.id,
+        user_name,
+        int(choice)
+    )
+
     await update_poll_message(poll_id, context)
 
 
-async def update_poll_message(poll_id: str, context: ContextTypes.DEFAULT_TYPE):
-    """Update poll message in all chats where it was sent."""
-    if poll_id not in polls:
+async def update_poll_message(poll_id, context):
+    poll = await db.get_poll(poll_id)
+    if not poll:
         return
-    
-    poll_data = polls[poll_id]
-    
-    # Create inline keyboard
-    keyboard = [
-        [
-            InlineKeyboardButton(f"Иду", callback_data=f"vote_{poll_id}_1"),
-            InlineKeyboardButton(f"Пропущу", callback_data=f"vote_{poll_id}_2")
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    message_text = format_poll_message(poll_data)
-    
-    # Try to update the original message if we have its ID
-    try:
-        if 'message_id' in poll_data and 'chat_id' in poll_data:
-            await context.bot.edit_message_text(
-                chat_id=poll_data['chat_id'],
-                message_id=poll_data['message_id'],
-                text=message_text,
-                reply_markup=reply_markup
-            )
-    except Exception as e:
-        logger.warning(f"Could not update original poll message: {e}")
 
+    keyboard = [[
+        InlineKeyboardButton("Иду", callback_data=f"vote_{poll_id}_1"),
+        InlineKeyboardButton("Пропущу", callback_data=f"vote_{poll_id}_2"),
+    ]]
+
+    markup = InlineKeyboardMarkup(keyboard)
+    text = format_poll_message(poll)
+
+    try:
+        await context.bot.edit_message_text(
+            chat_id=poll["chat_id"],
+            message_id=poll["message_id"],
+            text=text,
+            reply_markup=markup
+        )
+    except Exception as e:
+        logger.warning("Cannot update message: %s", e)
+
+
+# ────────────────────────────────────────────
+# MAIN
+# ────────────────────────────────────────────
+
+async def on_startup(app):
+    await db.connect()
+    logger.info("Database connected")
 
 def main():
-    """Start the bot."""
-    # Load environment variables from .env file
     load_dotenv()
-    # Get token from environment
-    token = os.getenv('TELEGRAM_BOT_TOKEN')
-    if not token:
-        logger.error("TELEGRAM_BOT_TOKEN not found in environment variables!")
-        return
-    
-    # Create application
-    application = Application.builder().token(token).build()
-    
-    # Conversation handler for poll creation
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('create', create_poll)],
-        states={
-            POLL_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, poll_name)],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)],
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+
+    app = Application.builder().token(token).post_init(on_startup).build()
+
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("create", create_poll)],
+        states={POLL_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, poll_name)]},
+        fallbacks=[CommandHandler("cancel", cancel)]
     )
-    
-    # Add handlers
-    application.add_handler(CommandHandler('start', start))
-    application.add_handler(CommandHandler('help', help_command))
-    application.add_handler(conv_handler)
-    application.add_handler(CallbackQueryHandler(vote_callback, pattern='^vote_'))
-    
-    # Add handler for group messages to catch poll names
-    application.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, 
-        handle_group_message
-    ))
-    
-    # Start the bot
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(conv)
+    app.add_handler(CallbackQueryHandler(vote_callback, pattern="^vote_"))
+    app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, handle_group_message))
+
     logger.info("Bot started!")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling()
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
