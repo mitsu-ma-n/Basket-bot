@@ -27,6 +27,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Globals
+MAIN_PLAYERS_LIMIT = 12
+
 # States
 POLL_NAME = range(1)
 
@@ -60,6 +63,7 @@ class Database:
                     user_id BIGINT,
                     user_name TEXT,
                     choice SMALLINT,
+                    voted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     PRIMARY KEY (poll_id, user_id),
                     FOREIGN KEY (poll_id) REFERENCES polls(poll_id) ON DELETE CASCADE
                 );
@@ -116,14 +120,17 @@ class Database:
                 return None
 
             votes = await conn.fetch("""
-                SELECT user_id, user_name, choice
+                SELECT user_id, user_name, choice, voted_at
                 FROM poll_votes
                 WHERE poll_id=$1
-                ORDER BY user_name
+                ORDER BY voted_at ASC
             """, poll_id)
 
-            voters1 = [v["user_name"] for v in votes if v["choice"] == 1]
-            voters2 = [v["user_name"] for v in votes if v["choice"] == 2]
+            #voters1 = [v["user_name"] for v in votes if v["choice"] == 1]
+            voters1 = [{"user_id": v["user_id"], "user_name": v["user_name"]}  for v in votes if v["choice"] == 1]
+
+            #voters2 = [v["user_name"] for v in votes if v["choice"] == 2]
+            voters2 = [{"user_id": v["user_id"], "user_name": v["user_name"]}  for v in votes if v["choice"] == 2]
 
             return {
                 "poll_id": poll["poll_id"],
@@ -138,10 +145,13 @@ class Database:
     async def add_vote(self, poll_id, user_id, user_name, choice):
         async with self.pool.acquire() as conn:
             await conn.execute("""
-                INSERT INTO poll_votes(poll_id, user_id, user_name, choice)
-                VALUES($1, $2, $3, $4)
+                INSERT INTO poll_votes(poll_id, user_id, user_name, choice, voted_at)
+                VALUES($1, $2, $3, $4, NOW())
                 ON CONFLICT (poll_id, user_id)
-                DO UPDATE SET user_name=EXCLUDED.user_name, choice=EXCLUDED.choice;
+                DO UPDATE SET
+                    user_name = EXCLUDED.user_name,
+                    choice = EXCLUDED.choice,
+                    voted_at = NOW();
             """, poll_id, user_id, user_name, choice)
 
 
@@ -156,24 +166,26 @@ def format_poll_message(poll):
     voters1 = poll["voters1"]
     voters2 = poll["voters2"]
 
-    main = voters1[:12]
-    reserve = voters1[12:]
+    main = voters1[:MAIN_PLAYERS_LIMIT]
+    reserve = voters1[MAIN_PLAYERS_LIMIT:]
+
+    logger.info(" Main: %s\n Reserve: %s\n Voters2: %s\n", main, reserve, voters2)
 
     msg = f"📊 {poll_name}\n\n"
 
     msg += "✅ Иду\n"
     if main:
-        msg += "\n".join(f"{i+1}. {v}" for i, v in enumerate(main)) + "\n"
+        msg += "\n".join(f"{i+1}. {v['user_name']}" for i, v in enumerate(main)) + "\n"
     else:
         msg += "Нет участников\n"
 
     if reserve:
         msg += "\n🔄 Запас\n"
-        msg += "\n".join(f"• {v}" for v in reserve) + "\n"
+        msg += "\n".join(f"• {v['user_name']}" for v in reserve) + "\n"
 
     msg += "\n❌ Пропущу\n"
     if voters2:
-        msg += "\n".join(f"• {v}" for v in voters2) + "\n"
+        msg += "\n".join(f"• {v['user_name']}" for v in voters2) + "\n"
     else:
         msg += "Нет участников\n"
 
@@ -271,6 +283,41 @@ async def cancel(update, context):
 # ────────────────────────────────────────────
 # VOTE HANDLING
 # ────────────────────────────────────────────
+async def notify_promoted_users(poll_before, poll_after, context):
+    if not poll_before or not poll_after:
+        return
+
+    main_before = poll_before["voters1"][:MAIN_PLAYERS_LIMIT]
+    reserve_before = poll_before["voters1"][MAIN_PLAYERS_LIMIT:]
+
+    main_after = poll_after["voters1"][:MAIN_PLAYERS_LIMIT]
+
+    main_before_ids = {u["user_id"] for u in main_before}
+    reserve_before_map = {
+        u["user_id"]: u["user_name"] for u in reserve_before
+    }
+
+    poll_name = poll_after["poll_name"]  # название голосования
+
+    for user in main_after:
+        uid = user["user_id"]
+        if uid not in main_before_ids and uid in reserve_before_map:
+            try:
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=(
+                        "✅ Вы перемещены из списка запаса в основной состав.\n\n"
+                        f"Тренировка: «{poll_name}»\n\n"
+                        "Теперь вы находитесь в основном списке и можете посетить тренировку."
+                    )
+                )
+            except Exception as e:
+                logger.warning(
+                    "Cannot notify user %s: %s",
+                    uid,
+                    e
+                )
+
 
 async def vote_callback(update, context):
     q = update.callback_query
@@ -287,14 +334,24 @@ async def vote_callback(update, context):
     user_name = q.from_user.first_name
     if q.from_user.last_name:
         user_name += " " + q.from_user.last_name
-    user_name += " (@" + q.from_user.username + ")"
+    if q.from_user.username:
+        user_name += " (@" + q.from_user.username + ")"
 
+    poll_before = await db.get_poll(poll_id)
 
     await db.add_vote(
         poll_id,
         q.from_user.id,
         user_name,
         int(choice)
+    )
+
+    poll_after = await db.get_poll(poll_id)
+
+    await notify_promoted_users(
+        poll_before,
+        poll_after,
+        context
     )
 
     await update_poll_message(poll_id, context)
@@ -335,6 +392,9 @@ async def on_startup(app):
 def main():
     load_dotenv()
     token = os.getenv("TELEGRAM_BOT_TOKEN")
+    global MAIN_PLAYERS_LIMIT
+    MAIN_PLAYERS_LIMIT = int(os.getenv("MAIN_PLAYERS_LIMIT", 12))
+    logger.info("MAIN_PLAYERS_LIMIT = %s", MAIN_PLAYERS_LIMIT)
 
     app = Application.builder().token(token).post_init(on_startup).build()
 
