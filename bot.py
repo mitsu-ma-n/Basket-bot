@@ -287,6 +287,8 @@ async def vote_callback(update, context):
     user_name = q.from_user.first_name
     if q.from_user.last_name:
         user_name += " " + q.from_user.last_name
+    user_name += " (@" + q.from_user.username + ")"
+
 
     await db.add_vote(
         poll_id,
