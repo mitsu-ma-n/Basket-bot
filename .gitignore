@@ -24,6 +24,7 @@ wheels/
 *.egg
 
 # Virtual Environment
+.venv/
 venv/
 env/
 ENV/
@@ -37,3 +38,6 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+
+# LOGS
+*.log
